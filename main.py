@@ -1,13 +1,16 @@
 import os
 import time
 import re
+import gzip
+import io
 from typing import Optional, Dict, List, Tuple, Any
 from urllib.parse import urljoin, urlparse, parse_qs
+from xml.etree import ElementTree as ET
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse
 import httpx
 
-app = FastAPI(title="Simple M3U → Xtream API (Live + Movies + Series + TMDB)")
+app = FastAPI(title="Simple M3U → Xtream API (Live + Movies + Series + TMDB + Multi-EPG)")
 
 # === CONFIG ===
 _raw_live = os.getenv("M3U_URLS", os.getenv("M3U_URL", "https://example.com/your-playlist.m3u"))
@@ -28,6 +31,11 @@ CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "60"))
 SERVER_URL = os.getenv("SERVER_URL", "your-render-url.onrender.com")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 
+# Multi-EPG sources (comma-separated). Supports .xml and .xml.gz
+_raw_epg = os.getenv("EPG_URLS", "")
+EPG_URLS = [u.strip() for u in _raw_epg.split(",") if u.strip()]
+EPG_CACHE_SECONDS = int(os.getenv("EPG_CACHE_SECONDS", "3600"))
+
 UPSTREAM_HEADERS = {
     "User-Agent": os.getenv("UPSTREAM_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20"),
 }
@@ -42,6 +50,13 @@ _cache = {
     "series_list": [],
     "series_categories": [],
     "series_episodes": {},
+    "fetched_at": 0,
+}
+
+_epg_cache = {
+    "channels": {},      # channel_id -> {"id", "display_name", "icon", "normalized"}
+    "programmes": [],    # list of dicts
+    "by_channel": {},    # channel_id -> list of programmes (sorted by start)
     "fetched_at": 0,
 }
 
@@ -61,6 +76,17 @@ def _get_category_id(group_name: str, category_ids: dict, categories: list) -> s
             "parent_id": 0,
         })
     return category_ids[group_name]
+
+
+def _normalize_name(name: str) -> str:
+    if not name:
+        return ""
+    n = name.lower().strip()
+    n = re.sub(r"\b(hd|fhd|uhd|4k|sd|hevc|h265|h264)\b", "", n)
+    n = re.sub(r"\[.*?\]|\(.*?\)", "", n)
+    n = re.sub(r"[^\w\s]", " ", n)
+    n = re.sub(r"\s+", " ", n).strip()
+    return n
 
 
 def _extract_movie_ids(url: str, name: str) -> Tuple[Optional[str], Optional[str]]:
@@ -177,7 +203,7 @@ def _fetch_movie_metadata(imdb_id: Optional[str] = None, tmdb_id: Optional[str] 
         "description": details.get("overview") or "",
         "releasedate": details.get("release_date") or "",
         "genre": genres,
-        "primary_genre": primary_genre,          # used for category
+        "primary_genre": primary_genre,
         "director": director,
         "actors": cast,
         "cast": cast,
@@ -249,7 +275,7 @@ def _fetch_series_metadata(tmdb_id: str) -> Optional[dict]:
         "cast": cast,
         "director": created_by,
         "genre": genres,
-        "primary_genre": primary_genre,          # used for category
+        "primary_genre": primary_genre,
         "releaseDate": details.get("first_air_date") or "",
         "last_modified": str(int(time.time())),
         "rating": str(rating),
@@ -261,6 +287,157 @@ def _fetch_series_metadata(tmdb_id: str) -> Optional[dict]:
     _tmdb_series_cache[cache_key] = meta
     return meta
 
+
+# ---------------------------------------------------------------------------
+# EPG helpers
+# ---------------------------------------------------------------------------
+
+def _parse_xmltv_text(content: str) -> Tuple[Dict[str, dict], List[dict]]:
+    channels: Dict[str, dict] = {}
+    programmes: List[dict] = []
+
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return channels, programmes
+
+    for ch in root.findall("channel"):
+        cid = ch.get("id") or ""
+        if not cid:
+            continue
+        display = ""
+        for dn in ch.findall("display-name"):
+            if dn.text:
+                display = dn.text.strip()
+                break
+        icon = ""
+        icon_el = ch.find("icon")
+        if icon_el is not None and icon_el.get("src"):
+            icon = icon_el.get("src")
+        channels[cid] = {
+            "id": cid,
+            "display_name": display,
+            "icon": icon,
+            "normalized": _normalize_name(display),
+        }
+
+    for prog in root.findall("programme"):
+        channel = prog.get("channel") or ""
+        start = prog.get("start") or ""
+        stop = prog.get("stop") or ""
+        title = ""
+        title_el = prog.find("title")
+        if title_el is not None and title_el.text:
+            title = title_el.text.strip()
+        desc = ""
+        desc_el = prog.find("desc")
+        if desc_el is not None and desc_el.text:
+            desc = desc_el.text.strip()
+        if not channel or not start:
+            continue
+        programmes.append({
+            "channel": channel,
+            "start": start,
+            "stop": stop,
+            "title": title,
+            "desc": desc,
+        })
+
+    return channels, programmes
+
+
+def _download_epg(url: str) -> Optional[str]:
+    try:
+        with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+            r = client.get(url, headers=UPSTREAM_HEADERS)
+            r.raise_for_status()
+            data = r.content
+            # Detect gzip
+            if url.lower().endswith(".gz") or data[:2] == b"\x1f\x8b":
+                try:
+                    data = gzip.decompress(data)
+                except Exception:
+                    pass
+            return data.decode("utf-8", errors="replace")
+    except Exception as e:
+        print(f"EPG fetch failed {url}: {e}")
+        return None
+
+
+def fetch_and_parse_epg(force: bool = False):
+    if not EPG_URLS:
+        return
+    now = time.time()
+    if not force and _epg_cache["channels"] and (now - _epg_cache["fetched_at"]) < EPG_CACHE_SECONDS:
+        return
+
+    all_channels: Dict[str, dict] = {}
+    all_programmes: List[dict] = []
+
+    for url in EPG_URLS:
+        text = _download_epg(url)
+        if not text:
+            continue
+        chs, progs = _parse_xmltv_text(text)
+        all_channels.update(chs)
+        all_programmes.extend(progs)
+
+    # Index programmes by channel, sorted by start
+    by_channel: Dict[str, list] = {}
+    for p in all_programmes:
+        by_channel.setdefault(p["channel"], []).append(p)
+    for cid in by_channel:
+        by_channel[cid].sort(key=lambda x: x["start"])
+
+    _epg_cache["channels"] = all_channels
+    _epg_cache["programmes"] = all_programmes
+    _epg_cache["by_channel"] = by_channel
+    _epg_cache["fetched_at"] = now
+
+
+def _match_epg_id(channel_name: str, existing_tvg_id: str = "") -> str:
+    """Return best EPG channel id for this live channel."""
+    if not _epg_cache["channels"]:
+        return existing_tvg_id or ""
+
+    # 1. Exact tvg-id match
+    if existing_tvg_id and existing_tvg_id in _epg_cache["channels"]:
+        return existing_tvg_id
+
+    # 2. Normalized name match
+    target = _normalize_name(channel_name)
+    if not target:
+        return existing_tvg_id or ""
+
+    for cid, info in _epg_cache["channels"].items():
+        if info["normalized"] == target:
+            return cid
+
+    # 3. Partial / contains match (weaker)
+    for cid, info in _epg_cache["channels"].items():
+        n = info["normalized"]
+        if n and (target in n or n in target) and abs(len(n) - len(target)) < 8:
+            return cid
+
+    return existing_tvg_id or ""
+
+
+def _xmltv_time_to_unix(t: str) -> int:
+    """Convert XMLTV time (YYYYMMDDHHMMSS +ZZZZ) to unix timestamp."""
+    try:
+        # Take first 14 digits
+        core = re.sub(r"[^\d]", "", t)[:14]
+        if len(core) < 14:
+            return 0
+        struct = time.strptime(core, "%Y%m%d%H%M%S")
+        return int(time.mktime(struct))
+    except Exception:
+        return 0
+
+
+# ---------------------------------------------------------------------------
+# M3U parsing
+# ---------------------------------------------------------------------------
 
 def _parse_m3u_text(
     content: str,
@@ -288,6 +465,7 @@ def _parse_m3u_text(
             group = "Uncategorized"
             logo = ""
             item_type = "live"
+            tvg_id = ""
 
             group_match = re.search(r'group-title="([^"]*)"', line)
             if group_match and group_match.group(1).strip():
@@ -300,6 +478,10 @@ def _parse_m3u_text(
             type_match = re.search(r'type="([^"]*)"', line)
             if type_match:
                 item_type = type_match.group(1).lower()
+
+            tvg_match = re.search(r'tvg-id="([^"]*)"', line)
+            if tvg_match:
+                tvg_id = tvg_match.group(1).strip()
 
             i += 1
             while i < len(lines) and not lines[i].strip():
@@ -325,7 +507,6 @@ def _parse_m3u_text(
                 rating = meta["rating"] if meta else "0"
                 rating_5 = meta["rating_5based"] if meta else 0
 
-                # Prefer TMDB primary genre for category if we already have it
                 final_group = group
                 if meta and meta.get("primary_genre"):
                     final_group = meta["primary_genre"]
@@ -369,33 +550,24 @@ def _parse_m3u_text(
                 tmdb_series_id = _extract_series_id_from_url(url)
 
                 if series_name not in series_map:
-                    meta = None
-                    if TMDB_API_KEY and tmdb_series_id:
-                        meta = _tmdb_series_cache.get(f"tmdb:{tmdb_series_id}")
-
-                    final_group = group
-                    if meta and meta.get("primary_genre"):
-                        final_group = meta["primary_genre"]
-                        cat_id = _get_category_id(final_group, series_cat_ids, series_categories)
-
                     series_map[series_name] = {
                         "num": next_series_id,
-                        "name": meta["name"] if meta else series_name,
+                        "name": series_name,
                         "series_id": next_series_id,
-                        "cover": (meta["cover"] if meta else logo) or logo,
-                        "plot": meta["plot"] if meta else "",
-                        "cast": meta["cast"] if meta else "",
-                        "director": meta["director"] if meta else "",
-                        "genre": meta["genre"] if meta else group,
-                        "releaseDate": meta["releaseDate"] if meta else "",
+                        "cover": logo,
+                        "plot": "",
+                        "cast": "",
+                        "director": "",
+                        "genre": group,
+                        "releaseDate": "",
                         "last_modified": str(int(time.time())),
-                        "rating": meta["rating"] if meta else "0",
-                        "rating_5based": meta["rating_5based"] if meta else 0,
-                        "backdrop_path": meta["backdrop_path"] if meta else [],
-                        "youtube_trailer": meta["youtube_trailer"] if meta else "",
-                        "episode_run_time": meta["episode_run_time"] if meta else "0",
+                        "rating": "0",
+                        "rating_5based": 0,
+                        "backdrop_path": [],
+                        "youtube_trailer": "",
+                        "episode_run_time": "0",
                         "category_id": cat_id,
-                        "category_name": final_group,
+                        "category_name": group,
                         "episodes": {},
                         "_tmdb_id": tmdb_series_id,
                         "_original_group": group,
@@ -432,17 +604,21 @@ def _parse_m3u_text(
                 })
 
             else:
+                # LIVE
                 cat_id = _get_category_id(group, live_cat_ids, live_categories)
+                # Match against loaded EPG if available
+                epg_id = _match_epg_id(name, tvg_id)
                 live_channels.append({
                     "num": next_live_id,
                     "name": name,
                     "stream_type": "live",
                     "stream_id": next_live_id,
                     "stream_icon": logo,
-                    "epg_channel_id": "",
+                    "epg_channel_id": epg_id,
                     "category_id": cat_id,
                     "category_name": group,
                     "url": url,
+                    "_tvg_id_raw": tvg_id,
                 })
                 next_live_id += 1
 
@@ -455,6 +631,9 @@ def fetch_and_parse_all():
     now = time.time()
     if _cache["live_channels"] and (now - _cache["fetched_at"]) < CACHE_SECONDS:
         return
+
+    # Load EPG first so matching works during M3U parse
+    fetch_and_parse_epg()
 
     live_channels = []
     live_cat_ids = {}
@@ -511,17 +690,25 @@ def check_auth(username: Optional[str], password: Optional[str]):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
 
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
 @app.get("/")
 def root():
     return {
         "status": "ok",
-        "message": "M3U Xtream proxy (Live + Movies + Series + TMDB)",
+        "message": "M3U Xtream proxy (Live + Movies + Series + TMDB + Multi-EPG)",
         "live_sources": len(LIVE_M3U_URLS),
+        "epg_sources": len(EPG_URLS),
+        "epg_channels_loaded": len(_epg_cache["channels"]),
+        "epg_programmes_loaded": len(_epg_cache["programmes"]),
         "movies_url": MOVIES_M3U_URL,
         "series_url": SERIES_M3U_URL,
         "tmdb_enabled": bool(TMDB_API_KEY),
         "tmdb_cached_movies": len(_tmdb_movie_cache),
         "tmdb_cached_series": len(_tmdb_series_cache),
+        "xmltv_endpoint": "/xmltv.php",
     }
 
 
@@ -532,6 +719,8 @@ async def player_api(
     action: Optional[str] = Query(None),
     series_id: Optional[str] = Query(None),
     vod_id: Optional[str] = Query(None),
+    stream_id: Optional[str] = Query(None),
+    limit: Optional[int] = Query(None),
 ):
     check_auth(username, password)
     fetch_and_parse_all()
@@ -576,7 +765,7 @@ async def player_api(
                 "stream_type": "live",
                 "stream_id": ch["stream_id"],
                 "stream_icon": ch["stream_icon"],
-                "epg_channel_id": "",
+                "epg_channel_id": ch.get("epg_channel_id") or "",
                 "added": str(int(time.time())),
                 "category_id": ch["category_id"],
                 "custom_sid": "",
@@ -585,6 +774,51 @@ async def player_api(
                 "tv_archive_duration": 0,
             })
         return JSONResponse(streams)
+
+    # Short EPG / simple data table (Xtream style)
+    if action in ("get_short_epg", "get_simple_data_table"):
+        if not stream_id:
+            return JSONResponse([])
+        try:
+            sid = int(stream_id)
+        except ValueError:
+            return JSONResponse([])
+
+        channel = None
+        for ch in _cache["live_channels"]:
+            if ch["stream_id"] == sid:
+                channel = ch
+                break
+        if not channel:
+            return JSONResponse([])
+
+        epg_id = channel.get("epg_channel_id") or ""
+        progs = _epg_cache["by_channel"].get(epg_id, []) if epg_id else []
+
+        now = int(time.time())
+        limit_n = limit or 4
+        result = []
+        for p in progs:
+            start_ts = _xmltv_time_to_unix(p["start"])
+            stop_ts = _xmltv_time_to_unix(p["stop"]) if p.get("stop") else start_ts + 3600
+            # Keep programmes that end in the future or recently started
+            if stop_ts < now - 3600:
+                continue
+            result.append({
+                "id": f"{epg_id}_{p['start']}",
+                "epg_id": epg_id,
+                "title": p.get("title") or "Unknown",
+                "lang": "en",
+                "start": str(start_ts),
+                "end": str(stop_ts),
+                "description": p.get("desc") or "",
+                "channel_id": str(sid),
+                "start_timestamp": start_ts,
+                "stop_timestamp": stop_ts,
+            })
+            if len(result) >= limit_n:
+                break
+        return JSONResponse({"epg_listings": result} if action == "get_short_epg" else result)
 
     # VOD / MOVIES
     if action == "get_vod_categories":
@@ -634,9 +868,7 @@ async def player_api(
             target["rating"] = meta["rating"]
             target["rating_5based"] = meta["rating_5based"]
 
-            # Option A: TMDB primary genre → category, else keep original
             new_group = meta.get("primary_genre") or target.get("_original_group") or "Uncategorized"
-            # Update category if needed
             cat_ids = {c["category_name"]: c["category_id"] for c in _cache["vod_categories"]}
             if new_group not in cat_ids:
                 new_id = str(len(_cache["vod_categories"]) + 1)
@@ -744,7 +976,6 @@ async def player_api(
             target["youtube_trailer"] = meta["youtube_trailer"]
             target["episode_run_time"] = meta["episode_run_time"]
 
-            # Option A: TMDB primary genre → category, else keep original
             new_group = meta.get("primary_genre") or target.get("_original_group") or "Uncategorized"
             cat_ids = {c["category_name"]: c["category_id"] for c in _cache["series_categories"]}
             if new_group not in cat_ids:
@@ -785,6 +1016,67 @@ async def player_api(
     return JSONResponse([])
 
 
+@app.get("/xmltv.php")
+@app.get("/epg.xml")
+async def xmltv_endpoint(
+    username: Optional[str] = Query(None),
+    password: Optional[str] = Query(None),
+):
+    """Merged XMLTV from all EPG_URLS, filtered to channels present in the live list."""
+    check_auth(username, password)
+    fetch_and_parse_all()
+    fetch_and_parse_epg()
+
+    # Only include EPG channels that match at least one live stream
+    used_ids = set()
+    for ch in _cache["live_channels"]:
+        eid = ch.get("epg_channel_id") or ""
+        if eid:
+            used_ids.add(eid)
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<tv generator-info-name="xstream-multi-epg">',
+    ]
+
+    for cid in sorted(used_ids):
+        info = _epg_cache["channels"].get(cid)
+        if not info:
+            continue
+        lines.append(f'  <channel id="{_xml_escape(cid)}">')
+        lines.append(f'    <display-name>{_xml_escape(info["display_name"])}</display-name>')
+        if info.get("icon"):
+            lines.append(f'    <icon src="{_xml_escape(info["icon"])}" />')
+        lines.append("  </channel>")
+
+    for p in _epg_cache["programmes"]:
+        if p["channel"] not in used_ids:
+            continue
+        start = p.get("start") or ""
+        stop = p.get("stop") or ""
+        stop_attr = f' stop="{_xml_escape(stop)}"' if stop else ""
+        lines.append(
+            f'  <programme start="{_xml_escape(start)}"{stop_attr} channel="{_xml_escape(p["channel"])}">'
+        )
+        lines.append(f'    <title>{_xml_escape(p.get("title") or "Unknown")}</title>')
+        if p.get("desc"):
+            lines.append(f'    <desc>{_xml_escape(p["desc"])}</desc>')
+        lines.append("  </programme>")
+
+    lines.append("</tv>")
+    return PlainTextResponse("\n".join(lines), media_type="application/xml")
+
+
+def _xml_escape(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+    )
+
+
 @app.get("/get.php")
 async def get_php(
     username: Optional[str] = Query(None),
@@ -800,7 +1092,8 @@ async def get_php(
     for ch in _cache["live_channels"]:
         logo = f' tvg-logo="{ch["stream_icon"]}"' if ch["stream_icon"] else ""
         group = f' group-title="{ch["category_name"]}"' if ch["category_name"] else ""
-        lines.append(f'#EXTINF:-1{logo}{group},{ch["name"]}')
+        tvg = f' tvg-id="{ch.get("epg_channel_id") or ""}"' if ch.get("epg_channel_id") else ""
+        lines.append(f'#EXTINF:-1{tvg}{logo}{group},{ch["name"]}')
         lines.append(ch["url"])
 
     for v in _cache["vod_streams"]:
@@ -812,37 +1105,31 @@ async def get_php(
     for s in _cache["series_list"]:
         for season, eps in s["episodes"].items():
             for ep in eps:
-                logo = f' tvg-logo="{ep["info"]["movie_image"]}"' if ep["info"]["movie_image"] else ""
-                title = f'{s["name"]} S{season.zfill(2)}E{str(ep["episode_num"]).zfill(2)} {ep["title"]}'
-                group = f' group-title="{s.get("category_name", s.get("genre", "Series"))}"'
-                lines.append(f'#EXTINF:-1 type="series"{logo}{group},{title}')
+                logo = f' tvg-logo="{s["cover"]}"' if s.get("cover") else ""
+                group = f' group-title="{s.get("category_name", "Series")}"'
+                name = f'{s["name"]} S{season}E{ep["episode_num"]} {ep.get("title", "")}'.strip()
+                lines.append(f'#EXTINF:-1 type="series"{logo}{group},{name}')
                 lines.append(ep["url"])
 
     return PlainTextResponse("\n".join(lines), media_type="audio/x-mpegurl")
 
 
 async def _proxy_stream(target_url: str):
-    looks_like_hls = target_url.split("?")[0].endswith(".m3u8")
-    if looks_like_hls:
-        try:
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=UPSTREAM_HEADERS) as client:
-                resp = await client.get(target_url)
-                resp.raise_for_status()
-                manifest_text = resp.text
-        except Exception as e:
-            raise HTTPException(status_code=502, detail=f"Failed to fetch HLS manifest: {e}")
-
-        rewritten_lines = []
-        for line in manifest_text.splitlines():
-            stripped = line.strip()
-            if stripped and not stripped.startswith("#"):
-                rewritten_lines.append(urljoin(target_url, stripped))
-            else:
-                rewritten_lines.append(line)
-        return PlainTextResponse(
-            "\n".join(rewritten_lines),
-            media_type="application/vnd.apple.mpegurl",
-        )
+    if target_url.endswith(".m3u8") or "m3u8" in target_url.lower():
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=UPSTREAM_HEADERS) as client:
+            r = await client.get(target_url)
+            r.raise_for_status()
+            rewritten_lines = []
+            for line in r.text.splitlines():
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    rewritten_lines.append(urljoin(target_url, stripped))
+                else:
+                    rewritten_lines.append(line)
+            return PlainTextResponse(
+                "\n".join(rewritten_lines),
+                media_type="application/vnd.apple.mpegurl",
+            )
 
     async def proxy_bytes():
         async with httpx.AsyncClient(timeout=None, follow_redirects=True, headers=UPSTREAM_HEADERS) as client:
