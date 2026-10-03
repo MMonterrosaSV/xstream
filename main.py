@@ -9,6 +9,8 @@ from xml.etree import ElementTree as ET
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse, StreamingResponse
 import httpx
+import tempfile
+import gc
 
 app = FastAPI(title="Simple M3U → Xtream API (Live + Movies + Series + TMDB + Multi-EPG)")
 
@@ -288,104 +290,91 @@ def _fetch_series_metadata(tmdb_id: str) -> Optional[dict]:
     return meta
 
 
+
+
 # ---------------------------------------------------------------------------
-# EPG helpers (memory-efficient – only keep channels that appear in playlists)
+# EPG helpers – fetch filtered EPG from Cloudflare Worker
 # ---------------------------------------------------------------------------
 
-def _parse_xmltv_stream(content: bytes, wanted_ids: set, wanted_names: set) -> Tuple[Dict[str, dict], Dict[str, list]]:
-    """
-    Stream-parse XMLTV. Keep only channels whose id is in wanted_ids
-    OR whose normalized display-name is in wanted_names.
-    Returns (channels_dict, by_channel_dict).
-    """
+import tempfile
+import gc
+from urllib.parse import urlencode
+
+# How many days of EPG to request from the Worker
+EPG_DAYS_PAST = int(os.getenv("EPG_DAYS_PAST", "1"))
+EPG_DAYS_FUTURE = int(os.getenv("EPG_DAYS_FUTURE", "3"))
+
+
+def _xmltv_time_to_unix(t: str) -> int:
+    """Convert XMLTV time (YYYYMMDDHHMMSS +ZZZZ) to unix timestamp."""
+    try:
+        core = re.sub(r"[^\d]", "", t)[:14]
+        if len(core) < 14:
+            return 0
+        struct = time.strptime(core, "%Y%m%d%H%M%S")
+        return int(time.mktime(struct))
+    except Exception:
+        return 0
+
+
+def _parse_filtered_xmltv(content: str) -> Tuple[Dict[str, dict], Dict[str, list]]:
+    """Parse the already-filtered XMLTV returned by the Cloudflare Worker."""
     channels: Dict[str, dict] = {}
     by_channel: Dict[str, list] = {}
 
-    # First pass: collect matching channels
-    source = io.BytesIO(content)
-    context = ET.iterparse(source, events=("end",))
-    for event, elem in context:
-        if elem.tag == "channel":
-            cid = elem.get("id") or ""
-            if not cid:
-                elem.clear()
-                continue
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError as e:
+        print(f"EPG parse error: {e}")
+        return channels, by_channel
 
-            display = ""
-            for dn in elem.findall("display-name"):
-                if dn.text:
-                    display = dn.text.strip()
-                    break
-            norm = _normalize_name(display)
+    for ch in root.findall("channel"):
+        cid = ch.get("id") or ""
+        if not cid:
+            continue
+        display = ""
+        for dn in ch.findall("display-name"):
+            if dn.text:
+                display = dn.text.strip()
+                break
+        icon = ""
+        icon_el = ch.find("icon")
+        if icon_el is not None and icon_el.get("src"):
+            icon = icon_el.get("src")
+        channels[cid] = {
+            "id": cid,
+            "display_name": display,
+            "icon": icon,
+            "normalized": _normalize_name(display),
+        }
 
-            keep = (cid in wanted_ids) or (norm and norm in wanted_names)
-            if keep:
-                icon = ""
-                icon_el = elem.find("icon")
-                if icon_el is not None and icon_el.get("src"):
-                    icon = icon_el.get("src")
-                channels[cid] = {
-                    "id": cid,
-                    "display_name": display,
-                    "icon": icon,
-                    "normalized": norm,
-                }
-            elem.clear()
+    for prog in root.findall("programme"):
+        channel = prog.get("channel") or ""
+        start = prog.get("start") or ""
+        stop = prog.get("stop") or ""
+        if not channel or not start:
+            continue
+        title = ""
+        title_el = prog.find("title")
+        if title_el is not None and title_el.text:
+            title = title_el.text.strip()
+        desc = ""
+        desc_el = prog.find("desc")
+        if desc_el is not None and desc_el.text:
+            desc = desc_el.text.strip()[:300]
 
-        elif elem.tag == "programme":
-            # Clear early – we will re-parse programmes in second pass
-            elem.clear()
+        by_channel.setdefault(channel, []).append({
+            "channel": channel,
+            "start": start,
+            "stop": stop,
+            "title": title,
+            "desc": desc,
+        })
 
-    # Second pass: only programmes belonging to kept channels
-    source.seek(0)
-    kept_ids = set(channels.keys())
-    context = ET.iterparse(source, events=("end",))
-    for event, elem in context:
-        if elem.tag == "programme":
-            channel = elem.get("channel") or ""
-            if channel in kept_ids:
-                start = elem.get("start") or ""
-                stop = elem.get("stop") or ""
-                title = ""
-                title_el = elem.find("title")
-                if title_el is not None and title_el.text:
-                    title = title_el.text.strip()
-                desc = ""
-                desc_el = elem.find("desc")
-                if desc_el is not None and desc_el.text:
-                    desc = desc_el.text.strip()
-                if start:
-                    by_channel.setdefault(channel, []).append({
-                        "channel": channel,
-                        "start": start,
-                        "stop": stop,
-                        "title": title,
-                        "desc": desc,
-                    })
-            elem.clear()
-
-    # Sort each channel’s programmes by start time
     for cid in by_channel:
         by_channel[cid].sort(key=lambda x: x["start"])
 
     return channels, by_channel
-
-
-def _download_epg(url: str) -> Optional[bytes]:
-    try:
-        with httpx.Client(timeout=90.0, follow_redirects=True) as client:
-            r = client.get(url, headers=UPSTREAM_HEADERS)
-            r.raise_for_status()
-            data = r.content
-            if url.lower().endswith(".gz") or data[:2] == b"\x1f\x8b":
-                try:
-                    data = gzip.decompress(data)
-                except Exception:
-                    pass
-            return data
-    except Exception as e:
-        print(f"EPG fetch failed {url}: {e}")
-        return None
 
 
 def fetch_and_parse_epg(
@@ -393,8 +382,13 @@ def fetch_and_parse_epg(
     wanted_ids: Optional[set] = None,
     wanted_names: Optional[set] = None,
 ):
+    """
+    Ask the Cloudflare Worker for a filtered EPG that only contains
+    the channels present in our playlists.
+    """
     if not EPG_URLS:
         return
+
     now = time.time()
     if not force and _epg_cache["channels"] and (now - _epg_cache["fetched_at"]) < EPG_CACHE_SECONDS:
         return
@@ -402,30 +396,46 @@ def fetch_and_parse_epg(
     wanted_ids = wanted_ids or set()
     wanted_names = wanted_names or set()
 
-    all_channels: Dict[str, dict] = {}
-    all_by_channel: Dict[str, list] = {}
+    # Build query string for the Worker
+    params = {
+        "days_past": str(EPG_DAYS_PAST),
+        "days_future": str(EPG_DAYS_FUTURE),
+    }
+    if wanted_ids:
+        params["ids"] = ",".join(sorted(wanted_ids))
+    if wanted_names:
+        params["names"] = ",".join(sorted(wanted_names))
 
-    for url in EPG_URLS:
-        raw = _download_epg(url)
-        if not raw:
-            continue
-        chs, by_ch = _parse_xmltv_stream(raw, wanted_ids, wanted_names)
-        all_channels.update(chs)
-        for cid, progs in by_ch.items():
-            all_by_channel.setdefault(cid, []).extend(progs)
+    # Use the first EPG_URL as the Worker base (e.g. https://epg.xxx.workers.dev/epg.xml)
+    base = EPG_URLS[0].rstrip("/")
+    if "?" in base:
+        # already has query – just append
+        worker_url = base + "&" + urlencode(params)
+    else:
+        worker_url = base + "?" + urlencode(params)
 
-    # Final sort in case multiple EPG sources contributed to the same channel
-    for cid in all_by_channel:
-        all_by_channel[cid].sort(key=lambda x: x["start"])
+    print(f"EPG: requesting filtered guide from Worker ({len(wanted_ids)} ids, {len(wanted_names)} names)")
+    print(f"EPG: {worker_url[:120]}...")
 
-    _epg_cache["channels"] = all_channels
-    _epg_cache["programmes"] = []          # no longer store the giant list
-    _epg_cache["by_channel"] = all_by_channel
+    try:
+        with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+            r = client.get(worker_url, headers=UPSTREAM_HEADERS)
+            r.raise_for_status()
+            text = r.text
+    except Exception as e:
+        print(f"EPG Worker request failed: {e}")
+        return
+
+    channels, by_channel = _parse_filtered_xmltv(text)
+
+    _epg_cache["channels"] = channels
+    _epg_cache["programmes"] = []
+    _epg_cache["by_channel"] = by_channel
     _epg_cache["fetched_at"] = now
-    print(
-        f"EPG loaded: {len(all_channels)} channels, "
-        f"{sum(len(v) for v in all_by_channel.values())} programmes (filtered)"
-    )
+    gc.collect()
+
+    total = sum(len(v) for v in by_channel.values())
+    print(f"EPG FINAL: {len(channels)} channels, {total} programmes (from Worker)")
 
 
 def _match_epg_id(channel_name: str, existing_tvg_id: str = "") -> str:
@@ -453,18 +463,6 @@ def _match_epg_id(channel_name: str, existing_tvg_id: str = "") -> str:
             return cid
 
     return existing_tvg_id or ""
-
-
-def _xmltv_time_to_unix(t: str) -> int:
-    """Convert XMLTV time (YYYYMMDDHHMMSS +ZZZZ) to unix timestamp."""
-    try:
-        core = re.sub(r"[^\d]", "", t)[:14]
-        if len(core) < 14:
-            return 0
-        struct = time.strptime(core, "%Y%m%d%H%M%S")
-        return int(time.mktime(struct))
-    except Exception:
-        return 0
 
 
 # ---------------------------------------------------------------------------
