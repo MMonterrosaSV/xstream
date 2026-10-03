@@ -55,7 +55,7 @@ _cache = {
 
 _epg_cache = {
     "channels": {},      # channel_id -> {"id", "display_name", "icon", "normalized"}
-    "programmes": [],    # list of dicts
+    "programmes": [],    # kept for compatibility, but no longer filled with full list
     "by_channel": {},    # channel_id -> list of programmes (sorted by start)
     "fetched_at": 0,
 }
@@ -289,110 +289,143 @@ def _fetch_series_metadata(tmdb_id: str) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
-# EPG helpers
+# EPG helpers (memory-efficient – only keep channels that appear in playlists)
 # ---------------------------------------------------------------------------
 
-def _parse_xmltv_text(content: str) -> Tuple[Dict[str, dict], List[dict]]:
+def _parse_xmltv_stream(content: bytes, wanted_ids: set, wanted_names: set) -> Tuple[Dict[str, dict], Dict[str, list]]:
+    """
+    Stream-parse XMLTV. Keep only channels whose id is in wanted_ids
+    OR whose normalized display-name is in wanted_names.
+    Returns (channels_dict, by_channel_dict).
+    """
     channels: Dict[str, dict] = {}
-    programmes: List[dict] = []
+    by_channel: Dict[str, list] = {}
 
+    # First pass: collect matching channels
+    source = io.BytesIO(content)
+    context = ET.iterparse(source, events=("end",))
+    for event, elem in context:
+        if elem.tag == "channel":
+            cid = elem.get("id") or ""
+            if not cid:
+                elem.clear()
+                continue
+
+            display = ""
+            for dn in elem.findall("display-name"):
+                if dn.text:
+                    display = dn.text.strip()
+                    break
+            norm = _normalize_name(display)
+
+            keep = (cid in wanted_ids) or (norm and norm in wanted_names)
+            if keep:
+                icon = ""
+                icon_el = elem.find("icon")
+                if icon_el is not None and icon_el.get("src"):
+                    icon = icon_el.get("src")
+                channels[cid] = {
+                    "id": cid,
+                    "display_name": display,
+                    "icon": icon,
+                    "normalized": norm,
+                }
+            elem.clear()
+
+        elif elem.tag == "programme":
+            # Clear early – we will re-parse programmes in second pass
+            elem.clear()
+
+    # Second pass: only programmes belonging to kept channels
+    source.seek(0)
+    kept_ids = set(channels.keys())
+    context = ET.iterparse(source, events=("end",))
+    for event, elem in context:
+        if elem.tag == "programme":
+            channel = elem.get("channel") or ""
+            if channel in kept_ids:
+                start = elem.get("start") or ""
+                stop = elem.get("stop") or ""
+                title = ""
+                title_el = elem.find("title")
+                if title_el is not None and title_el.text:
+                    title = title_el.text.strip()
+                desc = ""
+                desc_el = elem.find("desc")
+                if desc_el is not None and desc_el.text:
+                    desc = desc_el.text.strip()
+                if start:
+                    by_channel.setdefault(channel, []).append({
+                        "channel": channel,
+                        "start": start,
+                        "stop": stop,
+                        "title": title,
+                        "desc": desc,
+                    })
+            elem.clear()
+
+    # Sort each channel’s programmes by start time
+    for cid in by_channel:
+        by_channel[cid].sort(key=lambda x: x["start"])
+
+    return channels, by_channel
+
+
+def _download_epg(url: str) -> Optional[bytes]:
     try:
-        root = ET.fromstring(content)
-    except ET.ParseError:
-        return channels, programmes
-
-    for ch in root.findall("channel"):
-        cid = ch.get("id") or ""
-        if not cid:
-            continue
-        display = ""
-        for dn in ch.findall("display-name"):
-            if dn.text:
-                display = dn.text.strip()
-                break
-        icon = ""
-        icon_el = ch.find("icon")
-        if icon_el is not None and icon_el.get("src"):
-            icon = icon_el.get("src")
-        channels[cid] = {
-            "id": cid,
-            "display_name": display,
-            "icon": icon,
-            "normalized": _normalize_name(display),
-        }
-
-    for prog in root.findall("programme"):
-        channel = prog.get("channel") or ""
-        start = prog.get("start") or ""
-        stop = prog.get("stop") or ""
-        title = ""
-        title_el = prog.find("title")
-        if title_el is not None and title_el.text:
-            title = title_el.text.strip()
-        desc = ""
-        desc_el = prog.find("desc")
-        if desc_el is not None and desc_el.text:
-            desc = desc_el.text.strip()
-        if not channel or not start:
-            continue
-        programmes.append({
-            "channel": channel,
-            "start": start,
-            "stop": stop,
-            "title": title,
-            "desc": desc,
-        })
-
-    return channels, programmes
-
-
-def _download_epg(url: str) -> Optional[str]:
-    try:
-        with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+        with httpx.Client(timeout=90.0, follow_redirects=True) as client:
             r = client.get(url, headers=UPSTREAM_HEADERS)
             r.raise_for_status()
             data = r.content
-            # Detect gzip
             if url.lower().endswith(".gz") or data[:2] == b"\x1f\x8b":
                 try:
                     data = gzip.decompress(data)
                 except Exception:
                     pass
-            return data.decode("utf-8", errors="replace")
+            return data
     except Exception as e:
         print(f"EPG fetch failed {url}: {e}")
         return None
 
 
-def fetch_and_parse_epg(force: bool = False):
+def fetch_and_parse_epg(
+    force: bool = False,
+    wanted_ids: Optional[set] = None,
+    wanted_names: Optional[set] = None,
+):
     if not EPG_URLS:
         return
     now = time.time()
     if not force and _epg_cache["channels"] and (now - _epg_cache["fetched_at"]) < EPG_CACHE_SECONDS:
         return
 
+    wanted_ids = wanted_ids or set()
+    wanted_names = wanted_names or set()
+
     all_channels: Dict[str, dict] = {}
-    all_programmes: List[dict] = []
+    all_by_channel: Dict[str, list] = {}
 
     for url in EPG_URLS:
-        text = _download_epg(url)
-        if not text:
+        raw = _download_epg(url)
+        if not raw:
             continue
-        chs, progs = _parse_xmltv_text(text)
+        chs, by_ch = _parse_xmltv_stream(raw, wanted_ids, wanted_names)
         all_channels.update(chs)
-        all_programmes.extend(progs)
+        for cid, progs in by_ch.items():
+            all_by_channel.setdefault(cid, []).extend(progs)
 
-    # Index programmes by channel, sorted by start
-    by_channel: Dict[str, list] = {}
-    for p in all_programmes:
-        by_channel.setdefault(p["channel"], []).append(p)
-    for cid in by_channel:
-        by_channel[cid].sort(key=lambda x: x["start"])
+    # Final sort in case multiple EPG sources contributed to the same channel
+    for cid in all_by_channel:
+        all_by_channel[cid].sort(key=lambda x: x["start"])
 
     _epg_cache["channels"] = all_channels
-    _epg_cache["programmes"] = all_programmes
-    _epg_cache["by_channel"] = by_channel
+    _epg_cache["programmes"] = []          # no longer store the giant list
+    _epg_cache["by_channel"] = all_by_channel
     _epg_cache["fetched_at"] = now
+    print(
+        f"EPG loaded: {len(all_channels)} channels, "
+        f"{sum(len(v) for v in all_by_channel.values())} programmes (filtered)"
+    )
 
 
 def _match_epg_id(channel_name: str, existing_tvg_id: str = "") -> str:
@@ -425,7 +458,6 @@ def _match_epg_id(channel_name: str, existing_tvg_id: str = "") -> str:
 def _xmltv_time_to_unix(t: str) -> int:
     """Convert XMLTV time (YYYYMMDDHHMMSS +ZZZZ) to unix timestamp."""
     try:
-        # Take first 14 digits
         core = re.sub(r"[^\d]", "", t)[:14]
         if len(core) < 14:
             return 0
@@ -604,17 +636,15 @@ def _parse_m3u_text(
                 })
 
             else:
-                # LIVE
+                # LIVE – do NOT match EPG yet (EPG is loaded after all M3Us)
                 cat_id = _get_category_id(group, live_cat_ids, live_categories)
-                # Match against loaded EPG if available
-                epg_id = _match_epg_id(name, tvg_id)
                 live_channels.append({
                     "num": next_live_id,
                     "name": name,
                     "stream_type": "live",
                     "stream_id": next_live_id,
                     "stream_icon": logo,
-                    "epg_channel_id": epg_id,
+                    "epg_channel_id": "",          # filled later
                     "category_id": cat_id,
                     "category_name": group,
                     "url": url,
@@ -632,9 +662,6 @@ def fetch_and_parse_all():
     if _cache["live_channels"] and (now - _cache["fetched_at"]) < CACHE_SECONDS:
         return
 
-    # Load EPG first so matching works during M3U parse
-    fetch_and_parse_epg()
-
     live_channels = []
     live_cat_ids = {}
     live_categories = []
@@ -650,6 +677,7 @@ def fetch_and_parse_all():
     next_series_id = 1
     errors = []
 
+    # 1. Parse all M3Us first (no EPG yet)
     all_urls = LIVE_M3U_URLS + [MOVIES_M3U_URL, SERIES_M3U_URL]
 
     with httpx.Client(timeout=30.0, follow_redirects=True) as client:
@@ -671,6 +699,22 @@ def fetch_and_parse_all():
 
     if not live_channels and not vod_streams and not series_map and errors:
         raise HTTPException(status_code=502, detail=f"Failed to fetch any M3U source: {'; '.join(errors)}")
+
+    # 2. Collect wanted EPG identifiers from the live channels we just parsed
+    wanted_ids = set()
+    wanted_names = set()
+    for ch in live_channels:
+        raw = ch.get("_tvg_id_raw") or ""
+        if raw:
+            wanted_ids.add(raw)
+        wanted_names.add(_normalize_name(ch["name"]))
+
+    # 3. Load only the EPG data that matches our playlists
+    fetch_and_parse_epg(force=True, wanted_ids=wanted_ids, wanted_names=wanted_names)
+
+    # 4. Attach the best epg_channel_id to each live channel
+    for ch in live_channels:
+        ch["epg_channel_id"] = _match_epg_id(ch["name"], ch.get("_tvg_id_raw") or "")
 
     series_list = list(series_map.values())
     series_episodes = {s["series_id"]: s["episodes"] for s in series_list}
@@ -702,7 +746,7 @@ def root():
         "live_sources": len(LIVE_M3U_URLS),
         "epg_sources": len(EPG_URLS),
         "epg_channels_loaded": len(_epg_cache["channels"]),
-        "epg_programmes_loaded": len(_epg_cache["programmes"]),
+        "epg_programmes_loaded": sum(len(v) for v in _epg_cache["by_channel"].values()),
         "movies_url": MOVIES_M3U_URL,
         "series_url": SERIES_M3U_URL,
         "tmdb_enabled": bool(TMDB_API_KEY),
@@ -1015,7 +1059,6 @@ async def player_api(
 
     return JSONResponse([])
 
-
 @app.get("/xmltv.php")
 @app.get("/epg.xml")
 async def xmltv_endpoint(
@@ -1025,9 +1068,7 @@ async def xmltv_endpoint(
     """Merged XMLTV from all EPG_URLS, filtered to channels present in the live list."""
     check_auth(username, password)
     fetch_and_parse_all()
-    fetch_and_parse_epg()
 
-    # Only include EPG channels that match at least one live stream
     used_ids = set()
     for ch in _cache["live_channels"]:
         eid = ch.get("epg_channel_id") or ""
@@ -1049,19 +1090,19 @@ async def xmltv_endpoint(
             lines.append(f'    <icon src="{_xml_escape(info["icon"])}" />')
         lines.append("  </channel>")
 
-    for p in _epg_cache["programmes"]:
-        if p["channel"] not in used_ids:
-            continue
-        start = p.get("start") or ""
-        stop = p.get("stop") or ""
-        stop_attr = f' stop="{_xml_escape(stop)}"' if stop else ""
-        lines.append(
-            f'  <programme start="{_xml_escape(start)}"{stop_attr} channel="{_xml_escape(p["channel"])}">'
-        )
-        lines.append(f'    <title>{_xml_escape(p.get("title") or "Unknown")}</title>')
-        if p.get("desc"):
-            lines.append(f'    <desc>{_xml_escape(p["desc"])}</desc>')
-        lines.append("  </programme>")
+    # Use the per-channel index (memory efficient)
+    for cid in sorted(used_ids):
+        for p in _epg_cache["by_channel"].get(cid, []):
+            start = p.get("start") or ""
+            stop = p.get("stop") or ""
+            stop_attr = f' stop="{_xml_escape(stop)}"' if stop else ""
+            lines.append(
+                f'  <programme start="{_xml_escape(start)}"{stop_attr} channel="{_xml_escape(p["channel"])}">'
+            )
+            lines.append(f'    <title>{_xml_escape(p.get("title") or "Unknown")}</title>')
+            if p.get("desc"):
+                lines.append(f'    <desc>{_xml_escape(p["desc"])}</desc>')
+            lines.append("  </programme>")
 
     lines.append("</tv>")
     return PlainTextResponse("\n".join(lines), media_type="application/xml")
