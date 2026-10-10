@@ -33,6 +33,9 @@ CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "60"))
 SERVER_URL = os.getenv("SERVER_URL", "your-render-url.onrender.com")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 
+# GitHub Personal Access Token for private repos (classic token with "repo" scope recommended)
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()
+
 # Multi-EPG sources (comma-separated). Supports .xml and .xml.gz
 _raw_epg = os.getenv("EPG_URLS", "")
 EPG_URLS = [u.strip() for u in _raw_epg.split(",") if u.strip()]
@@ -41,6 +44,16 @@ EPG_CACHE_SECONDS = int(os.getenv("EPG_CACHE_SECONDS", "3600"))
 UPSTREAM_HEADERS = {
     "User-Agent": os.getenv("UPSTREAM_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20"),
 }
+
+
+def _get_fetch_headers(url: str) -> dict:
+    """Return request headers. Automatically adds GitHub token for private raw.githubusercontent.com / github.com URLs."""
+    headers = dict(UPSTREAM_HEADERS)
+    if GITHUB_TOKEN and ("raw.githubusercontent.com" in url or "github.com" in url):
+        # Classic PATs use "token", fine-grained tokens also accept "Bearer"
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+    return headers
+
 
 TMDB_IMG = "https://image.tmdb.org/t/p"
 
@@ -419,7 +432,7 @@ def fetch_and_parse_epg(
 
     try:
         with httpx.Client(timeout=60.0, follow_redirects=True) as client:
-            r = client.get(worker_url, headers=UPSTREAM_HEADERS)
+            r = client.get(worker_url, headers=_get_fetch_headers(worker_url))
             r.raise_for_status()
             text = r.text
     except Exception as e:
@@ -683,7 +696,7 @@ def fetch_and_parse_all():
             if not url:
                 continue
             try:
-                r = client.get(url, headers=UPSTREAM_HEADERS)
+                r = client.get(url, headers=_get_fetch_headers(url))
                 r.raise_for_status()
                 next_live_id, next_vod_id, next_series_id = _parse_m3u_text(
                     r.text,
