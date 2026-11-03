@@ -29,7 +29,8 @@ SERIES_M3U_URL = os.getenv(
 
 USERNAME = os.getenv("XTREAM_USER", "demo")
 PASSWORD = os.getenv("XTREAM_PASS", "demo")
-CACHE_SECONDS = int(os.getenv("CACHE_SECONDS", "60"))
+# Playlist cache disabled: always re-fetch M3U sources on every request
+CACHE_SECONDS = 0
 SERVER_URL = os.getenv("SERVER_URL", "your-render-url.onrender.com")
 TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
 
@@ -45,7 +46,6 @@ UPSTREAM_HEADERS = {
     "User-Agent": os.getenv("UPSTREAM_USER_AGENT", "VLC/3.0.20 LibVLC/3.0.20"),
 }
 
-
 def _get_fetch_headers(url: str) -> dict:
     """Return request headers. Automatically adds GitHub token for private raw.githubusercontent.com / github.com URLs."""
     headers = dict(UPSTREAM_HEADERS)
@@ -53,7 +53,6 @@ def _get_fetch_headers(url: str) -> dict:
         # Classic PATs use "token", fine-grained tokens also accept "Bearer"
         headers["Authorization"] = f"token {GITHUB_TOKEN}"
     return headers
-
 
 TMDB_IMG = "https://image.tmdb.org/t/p"
 
@@ -78,7 +77,6 @@ _epg_cache = {
 _tmdb_movie_cache: Dict[str, dict] = {}
 _tmdb_series_cache: Dict[str, dict] = {}
 
-
 def _get_category_id(group_name: str, category_ids: dict, categories: list) -> str:
     if not group_name:
         group_name = "Uncategorized"
@@ -92,7 +90,6 @@ def _get_category_id(group_name: str, category_ids: dict, categories: list) -> s
         })
     return category_ids[group_name]
 
-
 def _normalize_name(name: str) -> str:
     if not name:
         return ""
@@ -102,7 +99,6 @@ def _normalize_name(name: str) -> str:
     n = re.sub(r"[^\w\s]", " ", n)
     n = re.sub(r"\s+", " ", n).strip()
     return n
-
 
 def _extract_movie_ids(url: str, name: str) -> Tuple[Optional[str], Optional[str]]:
     imdb_id = None
@@ -125,7 +121,6 @@ def _extract_movie_ids(url: str, name: str) -> Tuple[Optional[str], Optional[str
             imdb_id = m.group(1).lower()
     return imdb_id, tmdb_id
 
-
 def _extract_series_id_from_url(url: str) -> Optional[str]:
     try:
         parsed = urlparse(url)
@@ -138,7 +133,6 @@ def _extract_series_id_from_url(url: str) -> Optional[str]:
     except Exception:
         pass
     return None
-
 
 def _tmdb_get(path: str, params: dict = None) -> Optional[dict]:
     if not TMDB_API_KEY:
@@ -153,7 +147,6 @@ def _tmdb_get(path: str, params: dict = None) -> Optional[dict]:
     except Exception:
         pass
     return None
-
 
 def _fetch_movie_metadata(imdb_id: Optional[str] = None, tmdb_id: Optional[str] = None) -> Optional[dict]:
     cache_key = imdb_id or (f"tmdb:{tmdb_id}" if tmdb_id else None)
@@ -242,7 +235,6 @@ def _fetch_movie_metadata(imdb_id: Optional[str] = None, tmdb_id: Optional[str] 
 
     return meta
 
-
 def _fetch_series_metadata(tmdb_id: str) -> Optional[dict]:
     cache_key = f"tmdb:{tmdb_id}"
     if cache_key in _tmdb_series_cache:
@@ -302,9 +294,6 @@ def _fetch_series_metadata(tmdb_id: str) -> Optional[dict]:
     _tmdb_series_cache[cache_key] = meta
     return meta
 
-
-
-
 # ---------------------------------------------------------------------------
 # EPG helpers – fetch filtered EPG from Cloudflare Worker
 # ---------------------------------------------------------------------------
@@ -317,7 +306,6 @@ from urllib.parse import urlencode
 EPG_DAYS_PAST = int(os.getenv("EPG_DAYS_PAST", "1"))
 EPG_DAYS_FUTURE = int(os.getenv("EPG_DAYS_FUTURE", "3"))
 
-
 def _xmltv_time_to_unix(t: str) -> int:
     """Convert XMLTV time (YYYYMMDDHHMMSS +ZZZZ) to unix timestamp."""
     try:
@@ -328,7 +316,6 @@ def _xmltv_time_to_unix(t: str) -> int:
         return int(time.mktime(struct))
     except Exception:
         return 0
-
 
 def _parse_filtered_xmltv(content: str) -> Tuple[Dict[str, dict], Dict[str, list]]:
     """Parse the already-filtered XMLTV returned by the Cloudflare Worker."""
@@ -388,7 +375,6 @@ def _parse_filtered_xmltv(content: str) -> Tuple[Dict[str, dict], Dict[str, list
         by_channel[cid].sort(key=lambda x: x["start"])
 
     return channels, by_channel
-
 
 def fetch_and_parse_epg(
     force: bool = False,
@@ -450,7 +436,6 @@ def fetch_and_parse_epg(
     total = sum(len(v) for v in by_channel.values())
     print(f"EPG FINAL: {len(channels)} channels, {total} programmes (from Worker)")
 
-
 def _match_epg_id(channel_name: str, existing_tvg_id: str = "") -> str:
     """Return best EPG channel id for this live channel."""
     if not _epg_cache["channels"]:
@@ -476,7 +461,6 @@ def _match_epg_id(channel_name: str, existing_tvg_id: str = "") -> str:
             return cid
 
     return existing_tvg_id or ""
-
 
 # ---------------------------------------------------------------------------
 # M3U parsing
@@ -667,11 +651,12 @@ def _parse_m3u_text(
 
     return next_live_id, next_vod_id, next_series_id
 
-
 def fetch_and_parse_all():
+    """
+    Always fetch and parse M3U sources on every call.
+    Playlist caching is disabled – no time-based early return.
+    """
     now = time.time()
-    if _cache["live_channels"] and (now - _cache["fetched_at"]) < CACHE_SECONDS:
-        return
 
     live_channels = []
     live_cat_ids = {}
@@ -739,11 +724,9 @@ def fetch_and_parse_all():
     _cache["series_episodes"] = series_episodes
     _cache["fetched_at"] = now
 
-
 def check_auth(username: Optional[str], password: Optional[str]):
     if username != USERNAME or password != PASSWORD:
         raise HTTPException(status_code=401, detail="Invalid credentials")
-
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -764,8 +747,8 @@ def root():
         "tmdb_cached_movies": len(_tmdb_movie_cache),
         "tmdb_cached_series": len(_tmdb_series_cache),
         "xmltv_endpoint": "/xmltv.php",
+        "playlist_cache_disabled": True,
     }
-
 
 @app.get("/player_api.php")
 async def player_api(
@@ -1118,7 +1101,6 @@ async def xmltv_endpoint(
     lines.append("</tv>")
     return PlainTextResponse("\n".join(lines), media_type="application/xml")
 
-
 def _xml_escape(s: str) -> str:
     return (
         s.replace("&", "&amp;")
@@ -1127,7 +1109,6 @@ def _xml_escape(s: str) -> str:
         .replace('"', "&quot;")
         .replace("'", "&apos;")
     )
-
 
 @app.get("/get.php")
 async def get_php(
@@ -1165,7 +1146,6 @@ async def get_php(
 
     return PlainTextResponse("\n".join(lines), media_type="audio/x-mpegurl")
 
-
 async def _proxy_stream(target_url: str):
     if target_url.endswith(".m3u8") or "m3u8" in target_url.lower():
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True, headers=UPSTREAM_HEADERS) as client:
@@ -1191,7 +1171,6 @@ async def _proxy_stream(target_url: str):
 
     return StreamingResponse(proxy_bytes(), media_type="video/mp2t")
 
-
 @app.get("/live/{user}/{passwd}/{stream_id_ext}")
 async def live_stream(user: str, passwd: str, stream_id_ext: str):
     check_auth(user, passwd)
@@ -1206,7 +1185,6 @@ async def live_stream(user: str, passwd: str, stream_id_ext: str):
             return await _proxy_stream(ch["url"])
     raise HTTPException(status_code=404, detail="Stream not found")
 
-
 @app.get("/movie/{user}/{passwd}/{stream_id_ext}")
 async def movie_stream(user: str, passwd: str, stream_id_ext: str):
     check_auth(user, passwd)
@@ -1220,7 +1198,6 @@ async def movie_stream(user: str, passwd: str, stream_id_ext: str):
         if v["stream_id"] == stream_id:
             return await _proxy_stream(v["url"])
     raise HTTPException(status_code=404, detail="Movie not found")
-
 
 @app.get("/series/{user}/{passwd}/{stream_id_ext}")
 async def series_stream(user: str, passwd: str, stream_id_ext: str):
